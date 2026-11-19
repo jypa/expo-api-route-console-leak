@@ -1,56 +1,64 @@
-# Welcome to your Expo app 👋
+# API route that reaches a `'use client'` module leaks the dev server's heap
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A new SDK 58 app (`create-expo-app --template default@sdk-58`) with `web.output: "server"` and `experiments.reactServerFunctions: true`. It adds two API routes:
 
-## Get started
+- `src/app/api/leak+api.ts` imports `expo`.
+- `src/app/api/plain+api.ts` imports nothing.
 
-1. Install dependencies
+Each request to `/api/leak` keeps about 12 MB on the `expo start` heap. The memory is never freed, so `expo start` stops with "JavaScript heap out of memory". In a larger app the route bundle is bigger, and each request keeps about 190 MB.
 
-   ```bash
-   npm install
+## Steps
+
+1. Install the packages:
+
+   ```sh
+   bun install
    ```
 
-2. Start the app
+2. Start the dev server with the heap logger. The logger prints the heap after a forced GC every 10 s.
 
-   ```bash
-   npx expo start
+   ```sh
+   NODE_OPTIONS="--expose-gc --require ./measure.cjs" npx expo start --port 8095
    ```
 
-In the output, you'll find options to open the app in a
+3. In a second terminal, send requests to each route:
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+   ```sh
+   PORT=8095 ./hammer.sh plain 200
+   PORT=8095 ./hammer.sh leak 200
+   ```
 
-You can start developing by editing the files inside the **src/app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+## Result
 
-## Get a fresh project
+@expo/cli 58.1.21, Node 24.15, macOS. Heap after a forced GC:
 
-When you're ready, run:
+| Step | Heap |
+|---|---|
+| After the first requests | 61 MB |
+| After 200 requests to `/api/plain` | 61 MB |
+| After 200 requests to `/api/leak` | 2,455 MB |
+| During the next 200 requests to `/api/leak` | Crash at about 4,000 MB |
 
-```bash
-npm run reset-project
+## Cause
+
+1. `MetroBundlerDevServer.ssrImportApiRoute` calls `evalMetroNoHandling` with `cache: false`. As a result, each request evaluates the route bundle again. A file change also clears the bundle cache.
+2. `expo` imports `expo-modules-core`. `expo-modules-core/build/EventEmitter.js` starts with `'use client'`. In a `react-server` bundle, a `'use client'` module pulls in `react-server-dom-webpack/server.edge`.
+3. In development, that module calls `patchConsole(console, …)` for each console method when it loads. Each wrapper calls the method that was there before it.
+4. Each evaluation adds one more wrapper to the chain. The chain keeps every evaluated copy of the bundle alive, and with it the `Module` and the source map that Node parsed for it. Heap snapshot retainer path: `console.info` → `wrapperMethod` → `originalMethod` → `wrapperMethod` → … → `Module`.
+
+## A fix that works here
+
+Save the console before the evaluation, and put it back after the evaluation, in `@expo/cli/build/src/start/server/getStaticRenderFunctions.js`:
+
+```js
+const consoleBeforeEval = Object.getOwnPropertyDescriptors(console);
+try {
+    return (0, _profile.profile)(_requireutils().evalModule, 'eval-metro-bundle')(src, filename, { /* unchanged */ });
+} finally {
+    Object.defineProperties(console, consoleBeforeEval);
+}
 ```
 
-This command will move the starter code to the **example** directory and create a blank **src/app** directory where you can start developing.
+With this change, 600 requests to `/api/leak` move the heap from 60 MB to 72 MB.
 
-### Other setup steps
-
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+`evalMetroNoHandling` also loads the RSC renderer, which is evaluated one time and then cached. On that path the restore also removes the console forwarding that React wants there. Therefore the right place for the restore is possibly only `ssrImportApiRoute`. Caching the evaluated route module also prevents the leak while no files change (expo/expo#49259 tried this, and it was closed without a merge). But a file change still evaluates the route again.
