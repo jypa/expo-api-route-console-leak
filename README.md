@@ -48,17 +48,17 @@ Each request to `/api/leak` keeps about 12 MB on the `expo start` heap. The memo
 
 ## A fix that works here
 
-Save the console before the evaluation, and put it back after the evaluation, in `@expo/cli/build/src/start/server/getStaticRenderFunctions.js`:
+Save the console before the evaluation in `MetroBundlerDevServer.ssrImportApiRoute`, and put it back after the evaluation (`@expo/cli/build/src/start/server/metro/MetroBundlerDevServer.js`):
 
 ```js
 const consoleBeforeEval = Object.getOwnPropertyDescriptors(console);
 try {
-    return (0, _profile.profile)(_requireutils().evalModule, 'eval-metro-bundle')(src, filename, { /* unchanged */ });
+    return (0, _getStaticRenderFunctions.evalMetroNoHandling)(this.projectRoot, apiRoute.src, apiRoute.filename, apiRoute.map);
 } finally {
     Object.defineProperties(console, consoleBeforeEval);
 }
 ```
 
-With this change, 600 requests to `/api/leak` move the heap from 60 MB to 72 MB.
+With this change, 300 requests to `/api/leak` move the heap from 60 MB to 69 MB.
 
-`evalMetroNoHandling` also loads the RSC renderer, which is evaluated one time and then cached. On that path the restore also removes the console forwarding that React wants there. Therefore the right place for the restore is possibly only `ssrImportApiRoute`. Caching the evaluated route module also prevents the leak while no files change (expo/expo#49259 tried this, and it was closed without a merge). But a file change still evaluates the route again.
+The restore is in `ssrImportApiRoute` and not in `evalMetroNoHandling`, because `evalMetroNoHandling` also loads the RSC renderer one time. On that path, React's console forwarding is intended. Caching the evaluated route module also prevents the leak while no files change (expo/expo#49259 tried this, and it was closed without a merge). But a file change still evaluates the route again.
